@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data/cache/
+runs/
+case_study_synthetic_test/
+out/
+.streamlit/secrets.toml
+*.zip
