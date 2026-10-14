@@ -11,46 +11,53 @@ NB = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
 FRONT_SPEED_MS = (3.0, 8.0)  # rough range for a glacial flood front; an assumption, labelled in the UI
 
 
-def trace(dem, proj, lon, lat, res_m, max_km=80.0, max_escape_px=40):
+def trace(dem, proj, lon, lat, res_m, max_km=80.0, max_cells=3_000_000):
+    """Path water takes from (lon, lat): always spill to the lowest cell next to the area
+    already reached (priority flood). Depressions in the DEM fill up and spill over, so the
+    path cannot get stuck or loop. Stops at the edge of the analysed area."""
+    import heapq
+
     h, w = dem.shape
     x, y = proj.xy(lon, lat)
     r, c = (int(v) for v in proj.rowcol(x, y))
     if not (0 <= r < h and 0 <= c < w) or not np.isfinite(dem[r, c]):
         raise ValueError("Start point is outside the analysed area")
     d = np.where(np.isfinite(dem), dem, np.inf)
-    visited = {(r, c)}
-    path = [(r, c)]
-    length = 0.0
-    while length < max_km * 1000:
-        z = d[r, c]
-        best, best_slope = None, 0.0
-        for dr, dc in NB:  # steepest downhill neighbour (D8)
-            rr, cc = r + dr, c + dc
-            if 0 <= rr < h and 0 <= cc < w and (rr, cc) not in visited:
-                sl = (z - d[rr, cc]) / math.hypot(dr, dc)
-                if sl > best_slope:
-                    best, best_slope = (rr, cc), sl
-        if best is None:  # pit or flat: jump to the lowest unvisited cell nearby that is not higher
-            found = None
-            for rad in range(2, max_escape_px + 1):
-                r0, r1, c0, c1 = max(0, r - rad), min(h, r + rad + 1), max(0, c - rad), min(w, c + rad + 1)
-                win = d[r0:r1, c0:c1].copy()
-                for (vr, vc) in path[-200:]:
-                    if r0 <= vr < r1 and c0 <= vc < c1:
-                        win[vr - r0, vc - c0] = np.inf
-                k = np.unravel_index(np.argmin(win), win.shape)
-                if win[k] <= z + 2.0:  # allow 2 m of DEM noise
-                    found = (r0 + k[0], c0 + k[1])
-                    break
-            if found is None:
-                break
-            best = found
-        if r in (0, h - 1) or c in (0, w - 1):
+    parent = {}
+    done = np.zeros((h, w), bool)
+    heap = [(float(d[r, c]), 0, r, c)]
+    parent[(r, c)] = None
+    end = (r, c)
+    n = 0
+    while heap and n < max_cells:
+        z, _, rr, cc = heapq.heappop(heap)
+        if done[rr, cc]:
+            continue
+        done[rr, cc] = True
+        n += 1
+        end = (rr, cc)
+        if rr in (0, h - 1) or cc in (0, w - 1):
+            break  # left the analysed area
+        for dr, dc in NB:
+            r2, c2 = rr + dr, cc + dc
+            if 0 <= r2 < h and 0 <= c2 < w and not done[r2, c2] and np.isfinite(d[r2, c2]):
+                if (r2, c2) not in parent:
+                    parent[(r2, c2)] = (rr, cc)
+                heapq.heappush(heap, (float(d[r2, c2]), n, r2, c2))  # always grow into the lowest cell next to the wet area
+    path = []
+    node = end
+    while node is not None:
+        path.append(node)
+        node = parent[node]
+    path.reverse()
+    # cap length
+    out, length = [path[0]], 0.0
+    for p0, p1 in zip(path, path[1:]):
+        length += math.hypot(p1[0] - p0[0], p1[1] - p0[1]) * res_m
+        out.append(p1)
+        if length > max_km * 1000:
             break
-        length += math.hypot(best[0] - r, best[1] - c) * res_m
-        r, c = best
-        visited.add(best)
-        path.append(best)
+    path = out
     rows = np.array([p[0] for p in path])
     cols = np.array([p[1] for p in path])
     T = proj.grid.transform

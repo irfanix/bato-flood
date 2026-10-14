@@ -33,16 +33,44 @@ def _collect(paths):
     return [f for f in files if f.lower().endswith((".shp", ".geojson", ".json", ".gpkg", ".kml"))]
 
 
+def _norm(x):
+    return x.lower().replace("_", "").replace("-", "").replace(" ", "")
+
+
+def _layers(files):
+    """Yield (name, path, layer) for every vector layer, including layers inside GeoPackages."""
+    for f in files:
+        if f.lower().endswith(".gpkg"):
+            try:
+                import pyogrio
+                for lyr in pyogrio.list_layers(f)[:, 0]:
+                    yield str(lyr), f, str(lyr)
+            except Exception:
+                import fiona
+                for lyr in fiona.listlayers(f):
+                    yield lyr, f, lyr
+        else:
+            yield os.path.basename(f), f, None
+
+
 def _read(files, key):
     import geopandas as gpd
     import pandas as pd
 
-    parts = [gpd.read_file(f) for f in files if key.lower() in os.path.basename(f).lower()]
-    parts = [p for p in parts if len(p)]
+    parts = []
+    for name, f, lyr in _layers(files):
+        if _norm(key) in _norm(name):
+            g = gpd.read_file(f, layer=lyr) if lyr else gpd.read_file(f)
+            if len(g):
+                parts.append(g)
     if not parts:
         return None
     crs = parts[0].crs or "EPSG:4326"
-    return gpd.GeoDataFrame(pd.concat([p.to_crs(crs) for p in parts], ignore_index=True), crs=crs)
+    return gpd.GeoDataFrame(pd.concat([p.to_crs(crs) if p.crs else p.set_crs(crs) for p in parts], ignore_index=True), crs=crs)
+
+
+def layer_names(paths):
+    return [n for n, _, _ in _layers(_collect(paths))]
 
 
 def compare(cls, grid, ems_paths, blds=None, out_png=None):
@@ -51,7 +79,7 @@ def compare(cls, grid, ems_paths, blds=None, out_png=None):
     files = _collect(ems_paths)
     ev = _read(files, "observedEvent")
     if ev is None:
-        raise ValueError("No 'observedEvent' layer found in the EMS package")
+        raise ValueError("No 'observedEvent' layer found. Layers seen: " + ", ".join(layer_names(ems_paths))[:800])
     aoi = _read(files, "areaOfInterest")
     ev = ev.to_crs(grid.crs)
     ref = rasterize(((g, 1) for g in ev.geometry if g is not None and not g.is_empty),
@@ -74,7 +102,7 @@ def compare(cls, grid, ems_paths, blds=None, out_png=None):
     iou = tp / (tp + fp + fn) if tp + fp + fn else 0.0
     res = dict(reference_km2=round((ref & valid).sum() * px, 2), ours_km2=round((ours & valid).sum() * px, 2),
                overlap_km2=round(tp * px, 2), precision=round(prec, 3), recall=round(rec, 3),
-               f1=round(f1, 3), iou=round(iou, 3), ems_layers=sorted({os.path.basename(f) for f in files})[:30])
+               f1=round(f1, 3), iou=round(iou, 3), ems_layers=[n for n, _, _ in _layers(files)][:40])
 
     # Building-level check if the package contains damage-graded built-up points/areas.
     bu = _read(files, "builtUp")

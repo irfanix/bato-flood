@@ -89,9 +89,16 @@ def analyse(edges, places, health, proj, aoi_bbox, s, buildings=None, household=
     pred_opt, dist_opt = _search(G, dest_nodes, open_states | {UNKNOWN})
     pred_pes, dist_pes = _search(G, dest_nodes, open_states)
 
-    btree = None
-    if buildings:
-        btree = cKDTree(np.array([[b["x"], b["y"]] for b in buildings]))
+    # Each building counts for its NEAREST settlement only (within 1 km), so neighbouring
+    # villages do not share and double-count the same houses.
+    owner_count = {}
+    cand = [p for p in places if p["place"] in ("village", "hamlet", "town", "city")]
+    if buildings and cand:
+        pxy = np.array([proj.xy(p["lon"], p["lat"]) for p in cand])
+        d_, i_ = cKDTree(pxy).query(np.array([[b["x"], b["y"]] for b in buildings]))
+        for dist_, idx_ in zip(d_, i_):
+            if dist_ <= 1000:
+                owner_count[cand[idx_]["id"]] = owner_count.get(cand[idx_]["id"], 0) + 1
 
     lon0, lat0, lon1, lat1 = aoi_bbox
     out = []
@@ -104,10 +111,8 @@ def analyse(edges, places, health, proj, aoi_bbox, s, buildings=None, household=
         n, snapd = _snap(tree, nodes, x, y, s.snap_max_m)
         rec = dict(name=p["name"], name_ne=p.get("name_ne"), place=p["place"], lon=p["lon"], lat=p["lat"],
                    osm_id=p["id"], snap_m=round(snapd))
-        nb = 0
-        if btree is not None:
-            nb = len(btree.query_ball_point([x, y], 750))
-        rec["buildings_750m"] = nb
+        nb = owner_count.get(p["id"], 0)
+        rec["buildings_nearby"] = nb
         if p.get("population"):
             rec["people"], rec["people_source"] = p["population"], "OSM population tag"
         else:
