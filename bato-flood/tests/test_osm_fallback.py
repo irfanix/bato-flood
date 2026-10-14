@@ -25,17 +25,19 @@ def test_overpass_fallback(monkeypatch, tmp_path):
         q = data["data"]
         seen.append(q)
         assert '[date:"2026-07-27T00:00:00Z"]' in q
-        if "highway" in q:
-            return Resp(200, {"elements": [{"type": "way", "id": 1, "tags": {"highway": "primary", "bridge": "yes", "name": "B"},
-                                            "geometry": [{"lat": 28.0, "lon": 85.0}, {"lat": 28.01, "lon": 85.01}]}]})
-        if "waterway" in q:
-            return Resp(200, {"elements": [{"type": "way", "id": 2, "tags": {"waterway": "river"},
-                                            "geometry": [{"lat": 28.0, "lon": 85.0}, {"lat": 28.1, "lon": 85.1}]}]})
-        if "place" in q:
-            return Resp(200, {"elements": [{"type": "node", "id": 3, "lat": 28.02, "lon": 85.02, "tags": {"place": "village", "name": "Gaun", "population": "1,200"}}]})
-        if "building" in q:
-            return Resp(200, {"elements": [{"type": "way", "id": 4, "center": {"lat": 28.02, "lon": 85.02}, "tags": {"building": "house"}}]})
-        return Resp(200, {"elements": [{"type": "way", "id": 5, "center": {"lat": 28.03, "lon": 85.03}, "tags": {"amenity": "hospital", "name": "H"}}]})
+        if len(seen) == 1:
+            return Resp(504)  # first mirror busy -> next mirror
+        return Resp(200, {"elements": [
+            {"type": "way", "id": 1, "tags": {"highway": "primary", "bridge": "yes", "name": "B"},
+             "geometry": [{"lat": 28.0, "lon": 85.0}, {"lat": 28.01, "lon": 85.01}]},
+            {"type": "way", "id": 2, "tags": {"waterway": "river"},
+             "geometry": [{"lat": 28.0, "lon": 85.0}, {"lat": 28.1, "lon": 85.1}]},
+            {"type": "node", "id": 3, "lat": 28.02, "lon": 85.02, "tags": {"place": "village", "name": "Gaun", "population": "1,200"}},
+            {"type": "way", "id": 4, "tags": {"building": "house"},
+             "geometry": [{"lat": 28.02, "lon": 85.02}, {"lat": 28.0201, "lon": 85.0201}, {"lat": 28.02, "lon": 85.0201}]},
+            {"type": "way", "id": 5, "tags": {"amenity": "hospital", "name": "H"},
+             "geometry": [{"lat": 28.03, "lon": 85.03}, {"lat": 28.0301, "lon": 85.0301}]},
+        ]})
 
     monkeypatch.setattr(osm.requests, "post", fake_post)
     osm.SOURCES_USED.clear()
@@ -45,4 +47,4 @@ def test_overpass_fallback(monkeypatch, tmp_path):
     assert d["health"][0]["kind"] == "hospital"
     assert len(d["buildings"]) == 1 and len(d["rivers"]) == 1
     assert any("Overpass" in s for s in d["source"])
-    assert "(27.99099,84.99099,28.10901,85.10901)" in seen[0]
+    assert len(seen) >= 2

@@ -46,7 +46,7 @@ class Settings:
     road_sample_m: float = 10.0
     # Network analysis
     snap_max_m: float = 2000.0           # settlement must be within this of a road
-    osm_buffer_km: float = 8.0           # roads/destinations fetched beyond the AOI
+    osm_buffer_km: float = 5.0           # roads/destinations fetched beyond the AOI
     include_tracks: bool = True          # jeep tracks count as roads
     include_paths: bool = False          # foot trails do not
     osm_snapshot: str | None = None      # default: min(event-1day, OHSOME_LATEST)

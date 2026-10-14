@@ -100,19 +100,105 @@ def _post(endpoint, bbox, snapshot, flt, overpass_stmt=None, props="tags"):
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             return json.load(f)
-    try:
-        js = _ohsome(endpoint, bbox, snapshot, flt, props)
-        SOURCES_USED.add("ohsome API")
-    except Exception as e:
-        if not overpass_stmt:
-            raise
-        log.warning("ohsome unavailable (%s); using Overpass attic snapshot instead", e)
-        mode = "geom" if endpoint.endswith("geometry") else "center"
-        js, url = _overpass(overpass_stmt, bbox, snapshot, mode)
-        SOURCES_USED.add(f"Overpass API attic data ({url.split('/')[2]})")
+    js = _ohsome(endpoint, bbox, snapshot, flt, props)
+    SOURCES_USED.add("ohsome API")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(js, f)
     return js
+
+
+def overpass_tiled(big, aoi, snapshot, road_rx, tile_deg=0.12):
+    """Pre-event OSM from Overpass attic data, one small query per tile (big queries time out).
+
+    Every tile asks for roads, rivers, buildings, places and health sites as they were on
+    `snapshot`. Tiles are cached, so a re-run continues where it stopped.
+    """
+    import math
+
+    nx_ = max(1, math.ceil((big[2] - big[0]) / tile_deg))
+    ny_ = max(1, math.ceil((big[3] - big[1]) / tile_deg))
+    seen = {}
+    total = nx_ * ny_
+    k = 0
+    for j in range(ny_):
+        for i in range(nx_):
+            k += 1
+            t = (big[0] + i * tile_deg, big[1] + j * tile_deg,
+                 min(big[2], big[0] + (i + 1) * tile_deg), min(big[3], big[1] + (j + 1) * tile_deg))
+            in_aoi = not (t[2] < aoi[0] or t[0] > aoi[2] or t[3] < aoi[1] or t[1] > aoi[3])
+            stmt = (f'way["highway"~"^({road_rx})$"](BBOX);'
+                    'way["waterway"~"^(river|canal)$"](BBOX);'
+                    'node["place"~"^(city|town|village|hamlet)$"]["name"](BBOX);'
+                    'way["place"~"^(city|town|village|hamlet)$"]["name"](BBOX);'
+                    'node["amenity"~"^(hospital|clinic|doctors)$"](BBOX);way["amenity"~"^(hospital|clinic|doctors)$"](BBOX);'
+                    'node["healthcare"~"^(hospital|clinic|centre)$"](BBOX);way["healthcare"~"^(hospital|clinic|centre)$"](BBOX);')
+            if in_aoi:
+                stmt += 'way["building"](BBOX);'
+            path = _cache(["overpass-tile", t, snapshot, stmt])
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    els = json.load(f)
+            else:
+                log.info("Overpass tile %d/%d", k, total)
+                els, url = _overpass_raw(stmt, t, snapshot)
+                SOURCES_USED.add(f"Overpass API attic data ({url.split('/')[2]})")
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(els, f)
+            for el in els:
+                seen[(el["type"], el["id"])] = el
+    roads, rivers, buildings, places, health = [], [], [], [], []
+    for (typ, oid), el in seen.items():
+        tg = el.get("tags", {})
+        props = dict(tg)
+        props["@osmId"] = f"{typ}/{oid}"
+        geom = el.get("geometry")
+        if typ == "node":
+            pt = [el["lon"], el["lat"]]
+        elif geom:
+            pts = [(p["lon"], p["lat"]) for p in geom if p]
+            pt = [sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)]
+        else:
+            continue
+        def feat(g):
+            return {"type": "Feature", "properties": props, "geometry": g}
+        line = {"type": "LineString", "coordinates": [[p["lon"], p["lat"]] for p in geom if p]} if geom else None
+        point = {"type": "Point", "coordinates": pt}
+        if "highway" in tg and line:
+            roads.append(feat(line))
+        elif "waterway" in tg and line:
+            rivers.append(feat(line))
+        elif "place" in tg:
+            places.append(feat(point))
+        elif "amenity" in tg or "healthcare" in tg:
+            health.append(feat(point))
+        elif "building" in tg and aoi[0] <= pt[0] <= aoi[2] and aoi[1] <= pt[1] <= aoi[3]:
+            buildings.append(feat(point))
+    fc = lambda x: {"type": "FeatureCollection", "features": x}
+    return fc(roads), fc(buildings), fc(places), fc(rivers), fc(health)
+
+
+def _overpass_raw(stmt, bbox, snapshot):
+    s, w, n, e = bbox[1], bbox[0], bbox[3], bbox[2]
+    bb = f"{s:.5f},{w:.5f},{n:.5f},{e:.5f}"
+    q = f'[out:json][timeout:180][date:"{snapshot}T00:00:00Z"];({stmt.replace("BBOX", bb)});out tags geom;'
+    last = None
+    for attempt in range(3):
+        for url in OVERPASS:
+            try:
+                r = requests.post(url, data={"data": q}, headers=UA, timeout=240)
+                if r.status_code in (429, 502, 503, 504):
+                    raise RuntimeError(f"busy ({r.status_code})")
+                r.raise_for_status()
+                js = r.json()
+                rem = js.get("remark") or ""
+                if "error" in rem.lower():
+                    raise RuntimeError(rem[:200])
+                return js.get("elements", []), url
+            except Exception as ex:
+                last = ex
+                log.warning("Overpass %s: %s", url.split("/")[2], ex)
+        time.sleep(15 * (attempt + 1))
+    raise RuntimeError(f"Overpass failed on a tile: {last}")
 
 
 def latest_snapshot() -> str | None:
@@ -137,18 +223,16 @@ def fetch(bbox, snapshot: str, buffer_km: float, include_tracks=True, include_pa
     if include_paths:
         kinds += ", path, footway, bridleway, steps"
     rx = "|".join(k.strip() for k in kinds.split(","))
-    roads = _post("elements/geometry", big, snapshot, f"type:way and highway in ({kinds})",
-                  f'way["highway"~"^({rx})$"](BBOX);')
-    buildings = _post("elements/centroid", bbox, snapshot, "building=* and geometry:polygon",
-                      'way["building"](BBOX);')
-    places = _post("elements/centroid", big, snapshot,
-                   "place in (city, town, village, hamlet) and name=*",
-                   'nwr["place"~"^(city|town|village|hamlet)$"]["name"](BBOX);')
-    rivers = _post("elements/geometry", big, snapshot, "type:way and waterway in (river, canal)",
-                   'way["waterway"~"^(river|canal)$"](BBOX);')
-    health = _post("elements/centroid", big, snapshot,
-                   "amenity in (hospital, clinic, doctors) or healthcare in (hospital, clinic, centre)",
-                   'nwr["amenity"~"^(hospital|clinic|doctors)$"](BBOX);nwr["healthcare"~"^(hospital|clinic|centre)$"](BBOX);')
+    try:
+        roads = _post("elements/geometry", big, snapshot, f"type:way and highway in ({kinds})")
+        buildings = _post("elements/centroid", bbox, snapshot, "building=* and geometry:polygon")
+        places = _post("elements/centroid", big, snapshot, "place in (city, town, village, hamlet) and name=*")
+        rivers = _post("elements/geometry", big, snapshot, "type:way and waterway in (river, canal)")
+        health = _post("elements/centroid", big, snapshot,
+                       "amenity in (hospital, clinic, doctors) or healthcare in (hospital, clinic, centre)")
+    except Exception as e:
+        log.warning("ohsome unavailable (%s); using Overpass attic snapshot in tiles instead", e)
+        roads, buildings, places, rivers, health = overpass_tiled(big, bbox, snapshot, rx)
 
     def tags(f):
         return f.get("properties", {}) or {}
