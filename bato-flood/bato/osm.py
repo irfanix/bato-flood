@@ -17,27 +17,102 @@ VEHICLE = ("motorway, trunk, primary, secondary, tertiary, unclassified, residen
            "service, road, motorway_link, trunk_link, primary_link, secondary_link, tertiary_link")
 
 
-def _post(endpoint, bbox, snapshot, flt, props="tags"):
+UA = {"User-Agent": "bato-flood/0.1 (hackathon prototype; github.com/irfanix/bato-flood)"}
+OVERPASS = ["https://overpass-api.de/api/interpreter",
+            "https://overpass.private.coffee/api/interpreter",
+            "https://maps.mail.ru/osm/tools/overpass/api/interpreter"]
+SOURCES_USED = set()
+
+
+def _cache(key_obj):
     os.makedirs(CACHE, exist_ok=True)
-    key = hashlib.md5(json.dumps([endpoint, bbox, snapshot, flt]).encode()).hexdigest()
-    path = os.path.join(CACHE, f"ohsome_{key}.json")
+    key = hashlib.md5(json.dumps(key_obj).encode()).hexdigest()
+    return os.path.join(CACHE, f"osm_{key}.json")
+
+
+def _ohsome(endpoint, bbox, snapshot, flt, props="tags"):
+    data = {"bboxes": ",".join(f"{v:.5f}" for v in bbox), "time": snapshot,
+            "filter": flt, "properties": props}
+    last = None
+    for attempt in range(2):
+        try:
+            r = requests.post(f"{OHSOME}/{endpoint}", data=data, headers=UA, timeout=300)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            log.warning("ohsome %s failed (%s), retry %d", endpoint, e, attempt + 1)
+            time.sleep(2)
+    raise RuntimeError(f"ohsome failed: {last}")
+
+
+def _overpass(stmt, bbox, snapshot, mode):
+    """Same pre-event snapshot through Overpass 'attic' data ([date:...]): OSM as it was then."""
+    s, w, n, e = bbox[1], bbox[0], bbox[3], bbox[2]
+    bb = f"{s:.5f},{w:.5f},{n:.5f},{e:.5f}"
+    q = (f'[out:json][timeout:600][maxsize:1073741824][date:"{snapshot}T00:00:00Z"];'
+         f'({stmt.replace("BBOX", bb)});out tags {mode};')
+    last = None
+    for url in OVERPASS:
+        for attempt in range(2):
+            try:
+                r = requests.post(url, data={"data": q}, headers=UA, timeout=900)
+                if r.status_code in (429, 504):
+                    raise RuntimeError(f"busy ({r.status_code})")
+                r.raise_for_status()
+                js = r.json()
+                if js.get("remark") and "error" in js["remark"].lower():
+                    raise RuntimeError(js["remark"][:200])
+                return _to_geojson(js, mode), url
+            except Exception as ex:
+                last = ex
+                log.warning("Overpass %s failed (%s)", url.split("/")[2], ex)
+                time.sleep(5 * (attempt + 1))
+    raise RuntimeError(f"Overpass failed: {last}")
+
+
+def _to_geojson(js, mode):
+    feats = []
+    for el in js.get("elements", []):
+        props = dict(el.get("tags", {}))
+        props["@osmId"] = f"{el['type']}/{el['id']}"
+        if mode == "geom":
+            g = el.get("geometry")
+            if not g:
+                continue
+            geom = {"type": "LineString", "coordinates": [[p["lon"], p["lat"]] for p in g if p]}
+        else:
+            if el["type"] == "node":
+                lon, lat = el.get("lon"), el.get("lat")
+            else:
+                c = el.get("center") or {}
+                lon, lat = c.get("lon"), c.get("lat")
+            if lon is None:
+                continue
+            geom = {"type": "Point", "coordinates": [lon, lat]}
+        feats.append({"type": "Feature", "properties": props, "geometry": geom})
+    return {"type": "FeatureCollection", "features": feats}
+
+
+def _post(endpoint, bbox, snapshot, flt, overpass_stmt=None, props="tags"):
+    """Pre-event OSM: ohsome first (as the brief suggests), Overpass attic data as fallback."""
+    path = _cache([endpoint, bbox, snapshot, flt])
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             return json.load(f)
-    data = {"bboxes": ",".join(f"{v:.5f}" for v in bbox), "time": snapshot,
-            "filter": flt, "properties": props}
-    for attempt in range(4):
-        try:
-            r = requests.post(f"{OHSOME}/{endpoint}", data=data, timeout=300)
-            r.raise_for_status()
-            js = r.json()
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(js, f)
-            return js
-        except Exception as e:  # network hiccup: retry with back-off
-            log.warning("ohsome %s failed (%s), retry %d", endpoint, e, attempt + 1)
-            time.sleep(3 * (attempt + 1))
-    raise RuntimeError("ohsome API not reachable")
+    try:
+        js = _ohsome(endpoint, bbox, snapshot, flt, props)
+        SOURCES_USED.add("ohsome API")
+    except Exception as e:
+        if not overpass_stmt:
+            raise
+        log.warning("ohsome unavailable (%s); using Overpass attic snapshot instead", e)
+        mode = "geom" if endpoint.endswith("geometry") else "center"
+        js, url = _overpass(overpass_stmt, bbox, snapshot, mode)
+        SOURCES_USED.add(f"Overpass API attic data ({url.split('/')[2]})")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(js, f)
+    return js
 
 
 def latest_snapshot() -> str | None:
@@ -61,13 +136,19 @@ def fetch(bbox, snapshot: str, buffer_km: float, include_tracks=True, include_pa
         kinds += ", track"
     if include_paths:
         kinds += ", path, footway, bridleway, steps"
-    roads = _post("elements/geometry", big, snapshot, f"type:way and highway in ({kinds})")
-    buildings = _post("elements/centroid", bbox, snapshot, "building=* and geometry:polygon")
+    rx = "|".join(k.strip() for k in kinds.split(","))
+    roads = _post("elements/geometry", big, snapshot, f"type:way and highway in ({kinds})",
+                  f'way["highway"~"^({rx})$"](BBOX);')
+    buildings = _post("elements/centroid", bbox, snapshot, "building=* and geometry:polygon",
+                      'way["building"](BBOX);')
     places = _post("elements/centroid", big, snapshot,
-                   "place in (city, town, village, hamlet) and name=*")
-    rivers = _post("elements/geometry", big, snapshot, "type:way and waterway in (river, canal)")
+                   "place in (city, town, village, hamlet) and name=*",
+                   'nwr["place"~"^(city|town|village|hamlet)$"]["name"](BBOX);')
+    rivers = _post("elements/geometry", big, snapshot, "type:way and waterway in (river, canal)",
+                   'way["waterway"~"^(river|canal)$"](BBOX);')
     health = _post("elements/centroid", big, snapshot,
-                   "amenity in (hospital, clinic, doctors) or healthcare in (hospital, clinic, centre)")
+                   "amenity in (hospital, clinic, doctors) or healthcare in (hospital, clinic, centre)",
+                   'nwr["amenity"~"^(hospital|clinic|doctors)$"](BBOX);nwr["healthcare"~"^(hospital|clinic|centre)$"](BBOX);')
 
     def tags(f):
         return f.get("properties", {}) or {}
@@ -114,5 +195,5 @@ def fetch(bbox, snapshot: str, buffer_km: float, include_tracks=True, include_pa
             out_rivers += g["coordinates"]
     log.info("OSM %s: %d road pieces, %d buildings, %d places, %d health sites", snapshot,
              len(out_roads), len(out_bld), len(out_places), len(out_health))
-    return dict(rivers=out_rivers, roads=out_roads, buildings=out_bld, places=out_places, health=out_health,
+    return dict(source=sorted(SOURCES_USED) or ['cache'], rivers=out_rivers, roads=out_roads, buildings=out_bld, places=out_places, health=out_health,
                 snapshot=snapshot, bbox_buffered=big)

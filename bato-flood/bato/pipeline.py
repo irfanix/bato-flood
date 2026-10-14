@@ -99,6 +99,7 @@ def run(s: Settings, area_name="Custom area", out_dir="out", s1_pre=None, s1_pos
     step("Cut-off analysis", 0.9)
 
     meta = dict(area_name=area_name, event_date=s.event_date, bbox=list(s.bbox), osm_snapshot=snap,
+                osm_source=data.get("source"),
                 s1_pairs=s1_meta, s2_pre=s2_pre_d, s2_post=s2_post_d, settings=s.to_dict(),
                 attribution=ATTRIBUTION)
     facts = report.build_facts(meta, fstats, istats, bridges, sett, cstats)

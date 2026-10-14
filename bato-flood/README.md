@@ -85,7 +85,7 @@ area + date
 - **Inputs:**
   - Sentinel-1 and Sentinel-2. Free and open Copernicus data, accessed via Microsoft Planetary Computer.
   - Copernicus DEM GLO-30.
-  - OpenStreetMap as it was **before** the event. The ohsome snapshot date is `min(event − 1 day, 2026-07-27)`.
+  - OpenStreetMap as it was **before** the event. The snapshot date is `min(event − 1 day, 2026-07-27)`. The snapshot comes from the ohsome API. If ohsome refuses the request (it returned 403 from Google Colab during our tests), Bato asks the Overpass API for the same date using its history ("attic") data, which is still OSM exactly as it was on that date. The source used is recorded in `facts.json` (`meta.osm_source`).
 - **Never used as inputs:** Copernicus EMS, UNOSAT or any other published damage maps, and post-event OSM edits. EMS maps are read only by `bato/compare.py`, after the analysis, to score it.
 - Basemaps in the web map are for display only. They are never analysed.
 - No training dataset was used, because we chose the copilot as the AI component.
